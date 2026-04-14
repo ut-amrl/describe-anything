@@ -16,7 +16,7 @@ classifiers = [
 # Depending your use cases, the version requirements can be relaxed.
 dependencies = [
     "torch>=2.0.0", "torchvision",
-    "transformers>=4.41.2", "tokenizers>=0.19.1", "sentencepiece",
+    "transformers>=4.41.2,<5.0.0", "tokenizers>=0.19.1", "sentencepiece",
     "accelerate>=0.28.0", 
     "pydantic>=2.10.1,<=2.10.6", 
     "numpy>=1.23.5,<2.0.0", 

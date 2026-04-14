@@ -1,0 +1,17 @@
+# Minimal conda environment for describe_image.py.
+# This is a lightweight HTTP client — no GPU or torch required.
+# The heavy models run inside the DAM and SAM3 containers.
+#
+# Create:  conda env create -f environment-client.yml
+# Activate: conda activate dam-client
+# Run:     python describe_image.py --npz ... --output ...
+
+name: dam-client
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pillow
+  - requests

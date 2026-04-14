@@ -78,6 +78,11 @@ class ChatCompletionRequest(BaseModel):
     num_beams: Optional[int] = 1
 
 
+class BatchChatCompletionRequest(BaseModel):
+    model: str
+    requests: List[ChatCompletionRequest]
+
+
 def load_image(image_url: str) -> Image:
     if image_url.startswith("http") or image_url.startswith("https"):
         response = requests.get(image_url)
@@ -119,6 +124,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(debug=True, lifespan=lifespan)
 
+# Set app.args from environment variables so the lifespan works whether this
+# module is imported by uvicorn (no __main__) or run directly. __main__ will
+# override this with CLI-parsed args when invoked as a script.
+app.args = argparse.Namespace(
+    host=os.getenv("DAM_HOST", "0.0.0.0"),
+    port=int(os.getenv("DAM_PORT", "8000")),
+    model_path=os.getenv("DAM_MODEL_PATH", "nvidia/DAM-3B"),
+    conv_mode=os.getenv("DAM_CONV_MODE", "v1"),
+    prompt_mode=os.getenv("DAM_PROMPT_MODE", "focal_prompt"),
+    temperature=float(os.getenv("DAM_TEMPERATURE", "0.2")),
+    top_p=float(os.getenv("DAM_TOP_P", "0.9")),
+    num_beams=int(os.getenv("DAM_NUM_BEAMS", "1")),
+    max_new_tokens=int(os.getenv("DAM_MAX_NEW_TOKENS", "512")),
+    workers=int(os.getenv("DAM_WORKERS", "1")),
+    image_video_joint_checkpoint=os.getenv("DAM_IMAGE_VIDEO_JOINT_CHECKPOINT", "").lower() in ("1", "true", "yes"),
+    debug=os.getenv("DAM_DEBUG", "").lower() in ("1", "true", "yes"),
+)
+
 
 async def convert_generator_to_async(gen: Generator) -> AsyncGenerator:
     for item in gen:
@@ -126,6 +149,64 @@ async def convert_generator_to_async(gen: Generator) -> AsyncGenerator:
         await asyncio.sleep(0)
 
 # Load model upon startup
+
+
+def _parse_request(request: ChatCompletionRequest):
+    """Parse images and query from a ChatCompletionRequest.
+
+    Returns a tuple of (image_pils, mask_pils, query).
+    Each image_pil is an RGB PIL image and each mask_pil is a grayscale PIL image.
+    """
+    messages = request.messages
+    images = []
+    query = ""
+
+    for message in messages:
+        if message.role == "user":
+            if isinstance(message.content, str):
+                query += message.content
+            elif isinstance(message.content, list):
+                for content in message.content:
+                    if content.type == "text":
+                        query += content.text
+                    elif content.type == "image_url":
+                        image = load_image(content.image_url.url)
+                        assert image.mode == "RGBA", f"Image mode is {image.mode}, but it should be RGBA"
+                        images.append(image)
+                    else:
+                        raise ValueError("Unsupported content type")
+        elif message.role == "assistant":
+            pass  # We can ignore assistant messages in the input
+
+    if len(images) == 0:
+        raise ValueError("No image with mask found in input messages.")
+
+    # Remove the prefix of the query if it exists. We detect the prefix and add it back on our own.
+    query = query.strip()
+    query = query.removeprefix("Image:")
+    query = query.removeprefix("Video:")
+    query = query.strip()
+    while query.startswith(DEFAULT_IMAGE_TOKEN):
+        query = query.removeprefix(DEFAULT_IMAGE_TOKEN)
+    assert DEFAULT_IMAGE_TOKEN not in query, f"{DEFAULT_IMAGE_TOKEN} should not be in other positions than the beginning of the query"
+    query = query.strip()
+
+    if app.args.image_video_joint_checkpoint:
+        if len(images) == 1:
+            query = f"Image: {DEFAULT_IMAGE_TOKEN}\n{query}"
+        elif len(images) == 8:
+            query = f"Video: {DEFAULT_IMAGE_TOKEN * 8}\n{query}"
+        else:
+            raise ValueError(
+                f"Only 1 image and video (with 8 frames) are supported, but {len(images)} images are provided")
+    else:
+        assert len(images) == 1, "Only one image with mask is supported"
+        query = f"{DEFAULT_IMAGE_TOKEN}\n{query}"
+
+    pils = [process_rgba_image(image) for image in images]
+    image_pils, mask_pils = zip(*pils)
+
+    return image_pils, mask_pils, query
 
 
 @app.post("/chat/completions")
@@ -140,59 +221,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 f"but the request model is {request.model}"
             )
 
-        messages = request.messages
-
-        images = []
-        query = ""
-
-        for message in messages:
-            if message.role == "user":
-                if isinstance(message.content, str):
-                    query += message.content
-                elif isinstance(message.content, list):
-                    for content in message.content:
-                        if content.type == "text":
-                            query += content.text
-                        elif content.type == "image_url":
-                            image = load_image(content.image_url.url)
-                            assert image.mode == "RGBA", f"Image mode is {image.mode}, but it should be RGBA"
-                            images.append(image)
-                        else:
-                            raise ValueError("Unsupported content type")
-            elif message.role == "assistant":
-                pass  # We can ignore assistant messages in the input
-
-        if len(images) == 0:
-            raise ValueError("No image with mask found in input messages.")
-
-        # Remove the prefix of the query if it exists. We detect the prefix and add it back on our own.
-        query = query.strip()
-        query = query.removeprefix("Image:")
-        query = query.removeprefix("Video:")
-        query = query.strip()
-        while query.startswith(DEFAULT_IMAGE_TOKEN):
-            query = query.removeprefix(DEFAULT_IMAGE_TOKEN)
-        assert DEFAULT_IMAGE_TOKEN not in query, f"{DEFAULT_IMAGE_TOKEN} should not be in other positions than the beginning of the query"
-        query = query.strip()
-
-        if app.args.image_video_joint_checkpoint:
-            if len(images) == 1:
-                query = f"Image: {DEFAULT_IMAGE_TOKEN}\n{query}"
-            elif len(images) == 8:
-                query = f"Video: {DEFAULT_IMAGE_TOKEN * 8}\n{query}"
-            else:
-                raise ValueError(
-                    f"Only 1 image and video (with 8 frames) are supported, but {len(images)} images are provided")
-        else:
-            assert len(images) == 1, "Only one image with mask is supported"
-            query = f"{DEFAULT_IMAGE_TOKEN}\n{query}"
-
-        # Print the query for debugging
-        # print(f"Query: {query}")
-
-        pils = [process_rgba_image(image) for image in images]
-
-        image_pils, mask_pils = zip(*pils)
+        image_pils, mask_pils, query = _parse_request(request)
 
         if request.stream:
             async def generate_stream():
@@ -255,6 +284,64 @@ async def chat_completions(request: ChatCompletionRequest):
                         role="assistant", content=outputs)}
                 ],
             }
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)},
+        )
+
+
+@app.post("/batch/chat/completions")
+async def batch_chat_completions(request: BatchChatCompletionRequest):
+    """Process multiple [image, mask] pairs in a single request.
+
+    Each item in ``requests`` is a standard ChatCompletionRequest (minus streaming).
+    Results are returned in the same order as the inputs.  Per-item errors are
+    captured inside each result rather than aborting the whole batch.
+    """
+    try:
+        global dam
+
+        # Validate the top-level model name once for the whole batch
+        if request.model != "describe_anything_model" and request.model != dam.model_name:
+            raise ValueError(
+                f"The endpoint is configured to use the model {dam.model_name}, "
+                f"but the request model is {request.model}"
+            )
+
+        results = []
+        for item in request.requests:
+            try:
+                image_pils, mask_pils, query = _parse_request(item)
+                outputs = dam.get_description(
+                    image_pils,
+                    mask_pils,
+                    query,
+                    streaming=False,
+                    temperature=app.args.temperature,
+                    top_p=app.args.top_p,
+                    num_beams=app.args.num_beams,
+                    max_new_tokens=app.args.max_new_tokens,
+                )
+                results.append({
+                    "id": uuid.uuid4().hex,
+                    "object": "chat.completion",
+                    "created": time.time(),
+                    "model": request.model,
+                    "choices": [
+                        {"message": ChatMessage(role="assistant", content=outputs)}
+                    ],
+                })
+            except Exception as e:
+                traceback.print_exc()
+                results.append({"error": str(e)})
+
+        return {
+            "object": "batch",
+            "results": results,
+        }
 
     except Exception as e:
         traceback.print_exc()
