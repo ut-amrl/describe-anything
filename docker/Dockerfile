@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/dam-venv
 
-
+COPY . /workspace/project
 
 RUN pip install --upgrade pip setuptools wheel && \
     pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
