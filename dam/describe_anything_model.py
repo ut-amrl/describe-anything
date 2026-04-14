@@ -167,6 +167,95 @@ class DescribeAnythingModel(nn.Module):
             
         return torch.cat((images_tensor, images_tensor2), dim=1) if images_tensor2 is not None else images_tensor
     
+    def get_batch_descriptions(self, requests, temperature=0.2, top_p=0.5, num_beams=1, max_new_tokens=512, **kwargs):
+        """Run true batched inference for multiple independent (image, mask, query) requests.
+
+        Args:
+            requests: list of (image_pils, mask_pils, query) tuples, one per request.
+                      Each image_pils / mask_pils is itself a list (len 1 for image mode,
+                      len 8 for video mode with image_video_joint_checkpoint).
+            temperature, top_p, num_beams, max_new_tokens: generation parameters.
+            **kwargs: forwarded to model.generate().
+
+        Returns:
+            list of description strings, in the same order as `requests`.
+        """
+        crop_mode, crop_mode2 = self.prompt_mode.split("+")
+        assert crop_mode == "full", (
+            "Current prompt only supports first crop as full (non-cropped). "
+            "If you need other specifications, please update the prompt."
+        )
+
+        all_image_tensors = []
+        all_input_ids = []   # list of 1-D tensors (variable length)
+        all_convs = []
+
+        for image_pils, mask_pils, query in requests:
+            assert len(image_pils) == len(mask_pils), (
+                f"image_pils and mask_pils must have the same length. "
+                f"Got {len(image_pils)} and {len(mask_pils)}."
+            )
+            for image_pil, mask_pil in zip(image_pils, mask_pils):
+                all_image_tensors.append(
+                    self.get_image_tensor(image_pil, mask_pil, crop_mode=crop_mode, crop_mode2=crop_mode2)
+                )
+            prompt, conv = self.get_prompt(query)
+            all_convs.append(conv)
+            ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+            all_input_ids.append(ids)
+
+        # Pad input_ids to uniform length (right-pad).
+        # Use pad_token_id if set, otherwise fall back to eos_token_id (Llama convention).
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+
+        max_len = max(ids.shape[0] for ids in all_input_ids)
+
+        # Build attention_mask from actual lengths so IMAGE_TOKEN_INDEX (-200) doesn't
+        # accidentally get treated as a pad token.
+        padded_ids_list = []
+        attn_mask_list = []
+        for ids in all_input_ids:
+            seq_len = ids.shape[0]
+            pad_len = max_len - seq_len
+            padded_ids_list.append(
+                torch.cat([ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
+            )
+            attn_mask_list.append(
+                torch.cat([torch.ones(seq_len, dtype=torch.long),
+                           torch.zeros(pad_len, dtype=torch.long)])
+            )
+
+        input_ids = torch.stack(padded_ids_list).cuda()       # [N, max_len]
+        attention_mask = torch.stack(attn_mask_list).cuda()   # [N, max_len]
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                input_ids=input_ids,
+                images=all_image_tensors,
+                attention_mask=attention_mask,
+                do_sample=True if temperature > 0 else False,
+                use_cache=True,
+                temperature=temperature,
+                top_p=top_p,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                **kwargs,
+            )
+
+        raw_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+
+        results = []
+        for raw, conv in zip(raw_outputs, all_convs):
+            stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+            text = raw.strip()
+            if text.endswith(stop_str):
+                text = text[: -len(stop_str)]
+            results.append(text.strip())
+
+        return results
+
     def get_description_from_prompt(self, image_pils, mask_pils, prompt, conv, streaming=False, temperature=0.2, top_p=0.5, num_beams=1, max_new_tokens=512, **kwargs):
         if streaming:
             return self.get_description_from_prompt_iterator(image_pils, mask_pils, prompt, conv, streaming=True, temperature=temperature, top_p=top_p, num_beams=num_beams, max_new_tokens=max_new_tokens, **kwargs)

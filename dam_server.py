@@ -140,6 +140,7 @@ app.args = argparse.Namespace(
     workers=int(os.getenv("DAM_WORKERS", "1")),
     image_video_joint_checkpoint=os.getenv("DAM_IMAGE_VIDEO_JOINT_CHECKPOINT", "").lower() in ("1", "true", "yes"),
     debug=os.getenv("DAM_DEBUG", "").lower() in ("1", "true", "yes"),
+    max_batch_size=int(os.getenv("DAM_MAX_BATCH_SIZE", "32")),
 )
 
 
@@ -311,32 +312,62 @@ async def batch_chat_completions(request: BatchChatCompletionRequest):
                 f"but the request model is {request.model}"
             )
 
-        results = []
-        for item in request.requests:
+        if len(request.requests) > app.args.max_batch_size:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        f"Batch size {len(request.requests)} exceeds the server limit of "
+                        f"{app.args.max_batch_size}. Split the request into smaller batches."
+                    )
+                },
+            )
+
+        # Parse all sub-requests first, recording any per-item parse errors.
+        parsed = []   # list of (image_pils, mask_pils, query) or None for failed items
+        parse_errors = {}  # index → error string
+        for idx, item in enumerate(request.requests):
             try:
-                image_pils, mask_pils, query = _parse_request(item)
-                outputs = dam.get_description(
-                    image_pils,
-                    mask_pils,
-                    query,
-                    streaming=False,
+                parsed.append(_parse_request(item))
+            except Exception as e:
+                traceback.print_exc()
+                parse_errors[idx] = str(e)
+                parsed.append(None)
+
+        # Run batched inference for all successfully-parsed items in one model call.
+        valid_indices = [i for i, p in enumerate(parsed) if p is not None]
+        if valid_indices:
+            try:
+                batch_outputs = dam.get_batch_descriptions(
+                    [parsed[i] for i in valid_indices],
                     temperature=app.args.temperature,
                     top_p=app.args.top_p,
                     num_beams=app.args.num_beams,
                     max_new_tokens=app.args.max_new_tokens,
                 )
-                results.append({
+            except Exception as e:
+                traceback.print_exc()
+                # If the whole batch call fails, attribute the error to every valid item.
+                batch_outputs = None
+                batch_error = str(e)
+
+        # Assemble results in original order.
+        results = [None] * len(request.requests)
+        for slot, orig_idx in enumerate(valid_indices):
+            if batch_outputs is not None:
+                results[orig_idx] = {
                     "id": uuid.uuid4().hex,
                     "object": "chat.completion",
                     "created": time.time(),
                     "model": request.model,
                     "choices": [
-                        {"message": ChatMessage(role="assistant", content=outputs)}
+                        {"message": ChatMessage(role="assistant", content=batch_outputs[slot])}
                     ],
-                })
-            except Exception as e:
-                traceback.print_exc()
-                results.append({"error": str(e)})
+                }
+            else:
+                results[orig_idx] = {"error": batch_error}
+        for idx, err in parse_errors.items():
+            results[idx] = {"error": err}
 
         return {
             "object": "batch",
@@ -375,6 +406,8 @@ if __name__ == "__main__":
                         help="The loaded checkpoint is an image-video joint checkpoint")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug mode")
+    parser.add_argument("--max_batch_size", type=int, default=int(os.getenv("DAM_MAX_BATCH_SIZE", "32")),
+                        help="Maximum number of requests accepted by /batch/chat/completions in a single call")
     app.args = parser.parse_args()
 
     if "joint" in app.args.model_path and not app.args.image_video_joint_checkpoint:
