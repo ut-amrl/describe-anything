@@ -413,5 +413,18 @@ if __name__ == "__main__":
     if "joint" in app.args.model_path and not app.args.image_video_joint_checkpoint:
         print("Warning: The loaded checkpoint looks like an image-video joint checkpoint, but the --image_video_joint_checkpoint flag is not set. This might lead to incorrect behavior, as joint checkpoints use a different prompt format even for single image inputs.")
 
-    uvicorn.run(app, host=app.args.host, port=app.args.port,
+    # Propagate parsed CLI args to env vars so that worker processes (which
+    # re-import this module without running __main__) pick up the same config.
+    os.environ["DAM_MODEL_PATH"] = app.args.model_path
+    os.environ["DAM_CONV_MODE"] = app.args.conv_mode
+    os.environ["DAM_PROMPT_MODE"] = app.args.prompt_mode
+    os.environ["DAM_TEMPERATURE"] = str(app.args.temperature)
+    os.environ["DAM_TOP_P"] = str(app.args.top_p)
+    os.environ["DAM_NUM_BEAMS"] = str(app.args.num_beams)
+    os.environ["DAM_MAX_NEW_TOKENS"] = str(app.args.max_new_tokens)
+    os.environ["DAM_MAX_BATCH_SIZE"] = str(app.args.max_batch_size)
+    os.environ["DAM_IMAGE_VIDEO_JOINT_CHECKPOINT"] = "1" if app.args.image_video_joint_checkpoint else "0"
+    os.environ["DAM_DEBUG"] = "1" if app.args.debug else "0"
+
+    uvicorn.run("dam_server:app", host=app.args.host, port=app.args.port,
                 workers=app.args.workers)

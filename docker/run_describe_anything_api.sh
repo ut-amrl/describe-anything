@@ -32,7 +32,10 @@ echo "  host:         $HOST"
 echo "  port:         $PORT"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 
+WORKERS="${DAM_WORKERS:-1}"
+
 exec uvicorn "$APP_MODULE" \
   --host "$HOST" \
   --port "$PORT" \
+  --workers "$WORKERS" \
   --log-level info

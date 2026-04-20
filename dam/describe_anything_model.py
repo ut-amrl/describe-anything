@@ -230,6 +230,10 @@ class DescribeAnythingModel(nn.Module):
         input_ids = torch.stack(padded_ids_list).cuda()       # [N, max_len]
         attention_mask = torch.stack(attn_mask_list).cuda()   # [N, max_len]
 
+        # All requests share the same conv template, so the stop string is the same.
+        stop_str = all_convs[0].sep if all_convs[0].sep_style != SeparatorStyle.TWO else all_convs[0].sep2
+        stopping_criteria = KeywordsStoppingCriteria([stop_str], self.tokenizer, input_ids)
+
         with torch.inference_mode():
             output_ids = self.model.generate(
                 input_ids=input_ids,
@@ -237,6 +241,7 @@ class DescribeAnythingModel(nn.Module):
                 attention_mask=attention_mask,
                 do_sample=True if temperature > 0 else False,
                 use_cache=True,
+                stopping_criteria=[stopping_criteria],
                 temperature=temperature,
                 top_p=top_p,
                 num_beams=num_beams,
